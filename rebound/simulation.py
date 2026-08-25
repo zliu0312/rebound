@@ -1317,9 +1317,9 @@ class Simulation(Structure):
         exact_finish_time: int, optional
             This argument determines whether REBOUND should try to finish at the exact time (tmax) you give it or if it is allowed to overshoot. Overshooting could happen if one starts at t=0, has a timestep of dt=10 and wants to integrate to tmax=25. With ``exact_finish_time=1``, the integrator will choose the last timestep such that t is exactly 25 after the integration, otherwise t=30. Note that changing the timestep does affect the accuracy of symplectic integrators negatively.
         given_tree: bool, optional
-            Only used by the ``whfast_hj`` integrator. If true, use the user-supplied HJ tree instead of rebuilding the tree every timestep.
+            Only used by the ``whfast_hj`` integrator. If true, compile and cache the supplied fixed HJ tree.
         tree: str or nested tuple/list, optional
-            The HJ tree to use when ``given_tree=True``. Leaves are 1-based particle indices, for example ``"[[1,2],3]"`` or ``[[1, 2], 3]``. The special string ``"binary_plus_particles"`` builds ``[[[1,2],3],...]`` directly in C.
+            The fixed HJ tree to use when ``given_tree=True``. Leaves are 1-based particle indices, for example ``"[[1,2],3]"`` or ``[[1, 2], 3]``. The special string ``"binary_plus_particles"`` builds ``[[[1,2],3],...]`` directly in C. WHFast HJ requires a tree before its first timestep and reuses it on later calls.
         
         Exceptions
         ----------
@@ -1363,10 +1363,6 @@ class Simulation(Structure):
                 self.process_messages()
                 raise GenericError("Could not set WHFast HJ tree.")
             self.process_messages()
-        elif str(self.integrator) == "whfast_hj":
-            clibrebound.reb_integrator_whfast_hj_clear_tree.argtypes = [POINTER(Simulation)]
-            clibrebound.reb_integrator_whfast_hj_clear_tree(byref(self))
-
         self.exact_finish_time = c_int(exact_finish_time)
         ret_value = clibrebound.reb_simulation_integrate(byref(self), c_double(tmax))
         if ret_value == 1:

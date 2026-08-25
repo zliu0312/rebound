@@ -7,23 +7,23 @@ REB_API int reb_integrator_whfast_hj_set_tree(struct reb_simulation* const r, co
 REB_API int reb_integrator_whfast_hj_set_binary_plus_particles_tree(struct reb_simulation* const r);
 REB_API void reb_integrator_whfast_hj_clear_tree(struct reb_simulation* const r);
 
-struct hj_node
-{
+struct reb_integrator_whfast_hj_node {
     struct reb_particle barycenter_particle;
     struct reb_particle jacobi_particle;
 
-    struct hj_node* primary;
-    struct hj_node* secondary;
+    size_t primary;
+    size_t secondary;
 
-    int particle_index; // -1 for internal node, >= 0 for leaf
+    double primary_offset;
+    double secondary_offset;
 };
 
 struct reb_integrator_whfast_hj_state {
-    // Internal use
-    struct hj_node* root;
+    // Fixed hierarchy, stored in postorder: leaves first, then binary orbits.
+    struct reb_integrator_whfast_hj_node* nodes;
     size_t tree_N;
 
-    // Use root as a user-supplied tree instead of rebuilding the tree each step.
+    // Set after a user-supplied tree has been compiled into nodes.
     int given_tree;
 };
 

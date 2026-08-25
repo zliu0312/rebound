@@ -41,22 +41,21 @@ class TestIntegratorWHFastHJGivenTree(unittest.TestCase):
         )
         return buffer.value.decode("ascii")
 
-    def test_given_tree_matches_automatic_tree(self):
-        sim_auto = self.make_sim()
-        sim_given = self.make_sim()
+    def test_fixed_tree_is_required(self):
+        sim = self.make_sim()
+        with self.assertRaises(RuntimeError):
+            sim.integrate(0.01, exact_finish_time=0)
 
-        tree = self.hj_tree_string(sim_auto)
-        sim_auto.integrate(0.1, exact_finish_time=0)
-        sim_given.integrate(0.1, exact_finish_time=0, given_tree=True, tree=tree)
+    def test_given_tree_is_cached_and_roundtrips(self):
+        sim = self.make_sim()
+        tree = "[[1,2],3]"
+        sim.integrate(0.05, exact_finish_time=0, given_tree=True, tree=tree)
+        self.assertEqual(sim.integrator.given_tree, 1)
+        self.assertEqual(self.hj_tree_string(sim), tree)
 
-        self.assertEqual(sim_given.integrator.given_tree, 1)
-        for particle_auto, particle_given in zip(sim_auto.particles, sim_given.particles):
-            for attr in ("x", "y", "z", "vx", "vy", "vz"):
-                self.assertAlmostEqual(
-                    getattr(particle_auto, attr),
-                    getattr(particle_given, attr),
-                    delta=1e-14,
-                )
+        # Later integration calls reuse the compiled hierarchy.
+        sim.integrate(0.1, exact_finish_time=0)
+        self.assertEqual(sim.integrator.given_tree, 1)
 
     def test_given_tree_accepts_nested_pairs(self):
         sim = self.make_sim()
@@ -64,18 +63,17 @@ class TestIntegratorWHFastHJGivenTree(unittest.TestCase):
         self.assertEqual(sim.integrator.given_tree, 1)
 
     def test_given_tree_accepts_binary_plus_particles_mode(self):
-        sim_auto = self.make_sim()
+        sim_explicit = self.make_sim()
         sim_mode = self.make_sim()
 
-        tree = self.hj_tree_string(sim_auto)
-        sim_auto.integrate(0.1, exact_finish_time=0, given_tree=True, tree=tree)
+        sim_explicit.integrate(0.1, exact_finish_time=0, given_tree=True, tree="[[1,2],3]")
         sim_mode.integrate(0.1, exact_finish_time=0, given_tree=True, tree="binary_plus_particles")
 
         self.assertEqual(sim_mode.integrator.given_tree, 1)
-        for particle_auto, particle_mode in zip(sim_auto.particles, sim_mode.particles):
+        for particle_explicit, particle_mode in zip(sim_explicit.particles, sim_mode.particles):
             for attr in ("x", "y", "z", "vx", "vy", "vz"):
                 self.assertAlmostEqual(
-                    getattr(particle_auto, attr),
+                    getattr(particle_explicit, attr),
                     getattr(particle_mode, attr),
                     delta=1e-14,
                 )
@@ -84,6 +82,26 @@ class TestIntegratorWHFastHJGivenTree(unittest.TestCase):
         sim = self.make_sim()
         with self.assertRaises(RuntimeError):
             sim.integrate(0.01, exact_finish_time=0, given_tree=True, tree="[1,1]")
+
+    def test_fixed_tree_rejects_mass_changes(self):
+        sim = self.make_sim()
+        sim.integrate(0.01, exact_finish_time=0, given_tree=True, tree="[[1,2],3]")
+        sim.particles[1].m = 0.2
+        with self.assertRaises(RuntimeError):
+            sim.integrate(0.02, exact_finish_time=0)
+
+    def test_fixed_tree_rejects_zero_mass_binary(self):
+        sim = self.make_sim()
+        sim.add(m=0.0, a=3.0)
+        with self.assertRaises(RuntimeError):
+            sim.integrate(0.01, exact_finish_time=0, given_tree=True, tree="[[1,2],[3,4]]")
+
+    def test_copied_simulation_requires_tree_again(self):
+        sim = self.make_sim()
+        sim.integrate(0.01, exact_finish_time=0, given_tree=True, tree="[[1,2],3]")
+        copied = sim.copy()
+        with self.assertRaises(RuntimeError):
+            copied.integrate(0.02, exact_finish_time=0)
 
 
 if __name__ == "__main__":

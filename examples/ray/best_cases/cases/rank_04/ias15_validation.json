@@ -2,6 +2,7 @@
   "id": "candidate_0155",
   "ias15_epsilon": 1e-12,
   "samples": 1001,
+  "duration_multiplier": 1.0,
   "ias15_max_energy_error": 4.5699608329361657e-14,
   "whfast": {
     "hierarchy_position_rms_error": 0.007538401532475997,
