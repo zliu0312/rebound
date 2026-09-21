@@ -19,7 +19,7 @@ const struct reb_integrator reb_integrator_whfast_hj = {
     .documentation =
     "WHFast HJ is a hierarchical Jacobi-coordinate variant of WHFast. "
     "It requires a fixed user-supplied binary hierarchy, which is compiled once "
-    "into a flat postordered representation.",
+    "into compact orbit arrays with shared barycenters for massless particles.",
     .step = reb_integrator_whfast_hj_step,
     .create = reb_integrator_whfast_hj_create,
     .free = reb_integrator_whfast_hj_free,
@@ -45,9 +45,10 @@ void* reb_integrator_whfast_hj_create(void)
 static void reb_integrator_whfast_hj_clear_state(struct reb_integrator_whfast_hj_state* const whfast)
 {
     free(whfast->nodes);
-    whfast->nodes = NULL;
-    whfast->tree_N = 0;
-    whfast->given_tree = 0;
+    free(whfast->p_jh);
+    free(whfast->barycenters);
+    free(whfast->masses);
+    *whfast = (struct reb_integrator_whfast_hj_state){0};
 }
 
 void reb_integrator_whfast_hj_free(void* state)
@@ -60,36 +61,25 @@ void reb_integrator_whfast_hj_free(void* state)
     free(whfast);
 }
 
-static void reb_integrator_whfast_hj_initialize_leaf(
-    struct reb_integrator_whfast_hj_node* const node,
-    const double mass
+// Resolve a subtree to its shared barycenter. A massless attachment aliases
+// its massive child, so a chain of test particles adds no barycenter work.
+static size_t reb_integrator_whfast_hj_barycenter_index(
+    const struct reb_integrator_whfast_hj_state* const whfast, const size_t index
 ){
-    *node = (struct reb_integrator_whfast_hj_node){0};
-    node->primary = SIZE_MAX;
-    node->secondary = SIZE_MAX;
-    node->barycenter_particle.m = mass;
+    return index < whfast->tree_N ? index : whfast->nodes[index - whfast->tree_N].barycenter;
 }
 
-static void reb_integrator_whfast_hj_update_internal_coordinate(
-    struct reb_integrator_whfast_hj_state* const whfast,
-    const size_t index
+static struct reb_particle* reb_integrator_whfast_hj_barycenter(
+    struct reb_simulation* const r, struct reb_integrator_whfast_hj_state* const whfast, const size_t index
 ){
-    struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[index];
-    const struct reb_particle primary = whfast->nodes[node->primary].barycenter_particle;
-    const struct reb_particle secondary = whfast->nodes[node->secondary].barycenter_particle;
+    const size_t host = reb_integrator_whfast_hj_barycenter_index(whfast, index);
+    return host < whfast->tree_N ? &r->particles[host] : &whfast->barycenters[host - whfast->tree_N];
+}
 
-    node->barycenter_particle = reb_particle_com_of_pair(primary, secondary);
-
-    node->jacobi_particle = (struct reb_particle){0};
-    node->jacobi_particle.x = secondary.x - primary.x;
-    node->jacobi_particle.y = secondary.y - primary.y;
-    node->jacobi_particle.z = secondary.z - primary.z;
-    node->jacobi_particle.vx = secondary.vx - primary.vx;
-    node->jacobi_particle.vy = secondary.vy - primary.vy;
-    node->jacobi_particle.vz = secondary.vz - primary.vz;
-    node->jacobi_particle.ax = secondary.ax - primary.ax;
-    node->jacobi_particle.ay = secondary.ay - primary.ay;
-    node->jacobi_particle.az = secondary.az - primary.az;
+static double reb_integrator_whfast_hj_subtree_mass(
+    const struct reb_integrator_whfast_hj_state* const whfast, const size_t index
+){
+    return index < whfast->tree_N ? whfast->masses[index] : whfast->p_jh[index - whfast->tree_N].m;
 }
 
 static int reb_integrator_whfast_hj_initialize_internal(
@@ -98,20 +88,25 @@ static int reb_integrator_whfast_hj_initialize_internal(
     const size_t primary,
     const size_t secondary
 ){
-    struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[index];
-    const double primary_mass = whfast->nodes[primary].barycenter_particle.m;
-    const double secondary_mass = whfast->nodes[secondary].barycenter_particle.m;
+    struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[index - whfast->tree_N];
+    const double primary_mass = reb_integrator_whfast_hj_subtree_mass(whfast, primary);
+    const double secondary_mass = reb_integrator_whfast_hj_subtree_mass(whfast, secondary);
     const double total_mass = primary_mass + secondary_mass;
-
-    *node = (struct reb_integrator_whfast_hj_node){0};
-    node->primary = primary;
-    node->secondary = secondary;
-    node->barycenter_particle.m = total_mass;
     if (!(total_mass > 0.)){
         return 1;
     }
+    node->primary = primary;
+    node->secondary = secondary;
     node->primary_offset = secondary_mass/total_mass;
     node->secondary_offset = primary_mass/total_mass;
+    whfast->p_jh[index - whfast->tree_N].m = total_mass;
+    if (primary_mass == 0.){
+        node->barycenter = reb_integrator_whfast_hj_barycenter_index(whfast, secondary);
+    }else if (secondary_mass == 0.){
+        node->barycenter = reb_integrator_whfast_hj_barycenter_index(whfast, primary);
+    }else{
+        node->barycenter = whfast->tree_N + whfast->N_barycenters++;
+    }
     return 0;
 }
 
@@ -223,10 +218,6 @@ static size_t reb_integrator_whfast_hj_parse_tree_node(struct reb_integrator_whf
 
         parser->used[particle_index] = 1;
         parser->leaf_count++;
-        reb_integrator_whfast_hj_initialize_leaf(
-            &parser->whfast->nodes[particle_index],
-            parser->r->particles[particle_index].m
-        );
         return particle_index;
     }
 
@@ -243,13 +234,24 @@ static int reb_integrator_whfast_hj_allocate_fixed_tree(
         return 1;
     }
     whfast->tree_N = r->N;
-    const size_t node_count = reb_integrator_whfast_hj_node_count(r->N);
-    if (node_count > 0){
-        whfast->nodes = calloc(node_count, sizeof(*whfast->nodes));
-        if (whfast->nodes == NULL){
-            reb_simulation_error(r, "WHFast HJ was not able to allocate memory for the fixed hierarchy.");
-            return 1;
-        }
+    const size_t orbit_count = r->N > 0 ? r->N - 1 : 0;
+    whfast->masses = r->N ? calloc(r->N, sizeof(*whfast->masses)) : NULL;
+    whfast->nodes = orbit_count ? calloc(orbit_count, sizeof(*whfast->nodes)) : NULL;
+    whfast->p_jh = orbit_count ? calloc(orbit_count, sizeof(*whfast->p_jh)) : NULL;
+    // At most K-1 new barycenters are needed for K nonzero-mass particles.
+    size_t massive_count = 0;
+    for (size_t i=0; i<r->N; i++){
+        massive_count += r->particles[i].m != 0.;
+    }
+    whfast->barycenters = massive_count > 1 ? calloc(massive_count - 1, sizeof(*whfast->barycenters)) : NULL;
+    if ((r->N && !whfast->masses) || (orbit_count && (!whfast->nodes || !whfast->p_jh)) ||
+            (massive_count > 1 && !whfast->barycenters)){
+        reb_integrator_whfast_hj_clear_state(whfast);
+        reb_simulation_error(r, "WHFast HJ was not able to allocate memory for the fixed hierarchy.");
+        return 1;
+    }
+    for (size_t i=0; i<r->N; i++){
+        whfast->masses[i] = r->particles[i].m;
     }
     return 0;
 }
@@ -326,9 +328,6 @@ REB_API int reb_integrator_whfast_hj_set_binary_plus_particles_tree(struct reb_s
         return 1;
     }
 
-    for (size_t i=0; i<r->N; i++){
-        reb_integrator_whfast_hj_initialize_leaf(&candidate.nodes[i], r->particles[i].m);
-    }
     if (r->N > 0){
         size_t root = 0;
         for (size_t i=1; i<r->N; i++){
@@ -382,13 +381,13 @@ static void reb_integrator_whfast_hj_tree_node_to_string(
     const size_t buffer_size,
     size_t* const required
 ){
-    const struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[index];
     if (index < whfast->tree_N){
         char leaf[32];
         snprintf(leaf, sizeof(leaf), "%zu", index + 1);
         reb_integrator_whfast_hj_tree_append(buffer, buffer_size, required, leaf);
         return;
     }
+    const struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[index - whfast->tree_N];
     reb_integrator_whfast_hj_tree_append(buffer, buffer_size, required, "[");
     reb_integrator_whfast_hj_tree_node_to_string(whfast, node->primary, buffer, buffer_size, required);
     reb_integrator_whfast_hj_tree_append(buffer, buffer_size, required, ",");
@@ -408,7 +407,7 @@ REB_API int reb_integrator_whfast_hj_tree_to_string(
         return -1;
     }
     const struct reb_integrator_whfast_hj_state* const whfast = r->integrator.state;
-    if (!whfast->given_tree || (whfast->tree_N > 0 && whfast->nodes == NULL)){
+    if (!whfast->given_tree || (whfast->tree_N > 1 && whfast->nodes == NULL)){
         return -1;
     }
 
@@ -422,67 +421,58 @@ REB_API int reb_integrator_whfast_hj_tree_to_string(
     return required > (size_t)INT_MAX ? -1 : (int)required;
 }
 
+// Positions/velocities and accelerations have separate passes: the gravity
+// evaluation changes only accelerations, so there is no midpoint round trip
+// for the already-current Jacobi positions and velocities.
 static void reb_integrator_whfast_hj_from_inertial(
     struct reb_simulation* const r,
-    struct reb_integrator_whfast_hj_state* const whfast
-){
-    for (size_t i=0; i<whfast->tree_N; i++){
-        whfast->nodes[i].barycenter_particle = r->particles[i];
-    }
-    const size_t node_count = reb_integrator_whfast_hj_node_count(whfast->tree_N);
-    for (size_t i=whfast->tree_N; i<node_count; i++){
-        reb_integrator_whfast_hj_update_internal_coordinate(whfast, i);
-    }
-}
-
-static void reb_integrator_whfast_hj_reconstruct_children(
     struct reb_integrator_whfast_hj_state* const whfast,
-    const size_t index
+    const int accelerations
 ){
-    const struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[index];
-    const struct reb_particle barycenter = node->barycenter_particle;
-    const struct reb_particle jacobi = node->jacobi_particle;
-    struct reb_particle* const primary = &whfast->nodes[node->primary].barycenter_particle;
-    struct reb_particle* const secondary = &whfast->nodes[node->secondary].barycenter_particle;
-
-    primary->x = barycenter.x - node->primary_offset*jacobi.x;
-    primary->y = barycenter.y - node->primary_offset*jacobi.y;
-    primary->z = barycenter.z - node->primary_offset*jacobi.z;
-    primary->vx = barycenter.vx - node->primary_offset*jacobi.vx;
-    primary->vy = barycenter.vy - node->primary_offset*jacobi.vy;
-    primary->vz = barycenter.vz - node->primary_offset*jacobi.vz;
-    primary->ax = barycenter.ax - node->primary_offset*jacobi.ax;
-    primary->ay = barycenter.ay - node->primary_offset*jacobi.ay;
-    primary->az = barycenter.az - node->primary_offset*jacobi.az;
-
-    secondary->x = barycenter.x + node->secondary_offset*jacobi.x;
-    secondary->y = barycenter.y + node->secondary_offset*jacobi.y;
-    secondary->z = barycenter.z + node->secondary_offset*jacobi.z;
-    secondary->vx = barycenter.vx + node->secondary_offset*jacobi.vx;
-    secondary->vy = barycenter.vy + node->secondary_offset*jacobi.vy;
-    secondary->vz = barycenter.vz + node->secondary_offset*jacobi.vz;
-    secondary->ax = barycenter.ax + node->secondary_offset*jacobi.ax;
-    secondary->ay = barycenter.ay + node->secondary_offset*jacobi.ay;
-    secondary->az = barycenter.az + node->secondary_offset*jacobi.az;
+    for (size_t i=0; i+1<whfast->tree_N; i++){
+        const struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[i];
+        const struct reb_particle* const primary = reb_integrator_whfast_hj_barycenter(r, whfast, node->primary);
+        const struct reb_particle* const secondary = reb_integrator_whfast_hj_barycenter(r, whfast, node->secondary);
+        struct reb_particle* const q = &whfast->p_jh[i];
+        struct reb_particle* const com = reb_integrator_whfast_hj_barycenter(r, whfast, whfast->tree_N + i);
+        const int shared = com == primary || com == secondary;
+#define HJ_FORWARD(field) \
+        q->field = secondary->field - primary->field; \
+        if (!shared) com->field = node->secondary_offset*primary->field + node->primary_offset*secondary->field;
+        if (accelerations){
+            HJ_FORWARD(ax); HJ_FORWARD(ay); HJ_FORWARD(az);
+        }else{
+            HJ_FORWARD(x); HJ_FORWARD(y); HJ_FORWARD(z);
+            HJ_FORWARD(vx); HJ_FORWARD(vy); HJ_FORWARD(vz);
+        }
+#undef HJ_FORWARD
+    }
 }
 
 static void reb_integrator_whfast_hj_to_inertial(
     struct reb_simulation* const r,
     struct reb_integrator_whfast_hj_state* const whfast
 ){
-    const size_t node_count = reb_integrator_whfast_hj_node_count(whfast->tree_N);
-    for (size_t i=node_count; i-- > whfast->tree_N;){
-        reb_integrator_whfast_hj_reconstruct_children(whfast, i);
-    }
-    for (size_t i=0; i<whfast->tree_N; i++){
-        const struct reb_particle source = whfast->nodes[i].barycenter_particle;
-        struct reb_particle* const particle = &r->particles[i];
-        particle->x = source.x;
-        particle->y = source.y;
-        particle->z = source.z;
-        particle->vx = source.vx;
-        particle->vy = source.vy;
-        particle->vz = source.vz;
+    for (size_t i=whfast->tree_N > 0 ? whfast->tree_N - 1 : 0; i-- > 0;){
+        const struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[i];
+        struct reb_particle* const primary = reb_integrator_whfast_hj_barycenter(r, whfast, node->primary);
+        struct reb_particle* const secondary = reb_integrator_whfast_hj_barycenter(r, whfast, node->secondary);
+        const struct reb_particle* const com = reb_integrator_whfast_hj_barycenter(r, whfast, whfast->tree_N + i);
+        const struct reb_particle* const q = &whfast->p_jh[i];
+        // Shared hosts have already been reconstructed by their ancestors.
+        // Only place the massless child; do not rewrite the host for each tracer.
+#define HJ_PRIMARY(field) primary->field = com->field - node->primary_offset*q->field
+#define HJ_SECONDARY(field) secondary->field = com->field + node->secondary_offset*q->field
+        if (primary != com){
+            HJ_PRIMARY(x); HJ_PRIMARY(y); HJ_PRIMARY(z);
+            HJ_PRIMARY(vx); HJ_PRIMARY(vy); HJ_PRIMARY(vz);
+        }
+        if (secondary != com){
+            HJ_SECONDARY(x); HJ_SECONDARY(y); HJ_SECONDARY(z);
+            HJ_SECONDARY(vx); HJ_SECONDARY(vy); HJ_SECONDARY(vz);
+        }
+#undef HJ_PRIMARY
+#undef HJ_SECONDARY
     }
 }
 
@@ -491,17 +481,15 @@ static void reb_integrator_whfast_hj_interaction_step(
     struct reb_integrator_whfast_hj_state* const whfast,
     const double dt
 ){
-    const size_t node_count = reb_integrator_whfast_hj_node_count(whfast->tree_N);
-    for (size_t i=whfast->tree_N; i<node_count; i++){
-        struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[i];
-        struct reb_particle* const p = &node->jacobi_particle;
+    for (size_t i=0; i+1<whfast->tree_N; i++){
+        struct reb_particle* const p = &whfast->p_jh[i];
         p->vx += dt*p->ax;
         p->vy += dt*p->ay;
         p->vz += dt*p->az;
 
         const double inverse_r2 = 1./(p->x*p->x + p->y*p->y + p->z*p->z);
         const double inverse_r = sqrt(inverse_r2);
-        const double prefactor = dt*r->G*node->barycenter_particle.m*inverse_r*inverse_r2;
+        const double prefactor = dt*r->G*p->m*inverse_r*inverse_r2;
         p->vx += prefactor*p->x;
         p->vy += prefactor*p->y;
         p->vz += prefactor*p->z;
@@ -513,14 +501,13 @@ static void reb_integrator_whfast_hj_kepler_step(
     struct reb_integrator_whfast_hj_state* const whfast,
     const double dt
 ){
-    const size_t node_count = reb_integrator_whfast_hj_node_count(whfast->tree_N);
-    for (size_t i=whfast->tree_N; i<node_count; i++){
-        struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[i];
-        reb_integrator_whfast_kepler_solver(&node->jacobi_particle, node->barycenter_particle.m*r->G, dt, r);
+    for (size_t i=0; i+1<whfast->tree_N; i++){
+        reb_integrator_whfast_kepler_solver(&whfast->p_jh[i], whfast->p_jh[i].m*r->G, dt, r);
     }
 }
 
 static void reb_integrator_whfast_hj_com_step(
+    struct reb_simulation* const r,
     struct reb_integrator_whfast_hj_state* const whfast,
     const double dt
 ){
@@ -528,7 +515,7 @@ static void reb_integrator_whfast_hj_com_step(
     if (node_count == 0){
         return;
     }
-    struct reb_particle* const com = &whfast->nodes[node_count - 1].barycenter_particle;
+    struct reb_particle* const com = reb_integrator_whfast_hj_barycenter(r, whfast, node_count - 1);
     com->x += dt*com->vx;
     com->y += dt*com->vy;
     com->z += dt*com->vz;
@@ -539,7 +526,7 @@ void reb_integrator_whfast_hj_step(struct reb_simulation* const r, void* state)
     struct reb_integrator_whfast_hj_state* const whfast = state;
     const double dt = r->dt;
 
-    if (!whfast->given_tree || (r->N > 0 && whfast->nodes == NULL)){
+    if (!whfast->given_tree || (r->N > 1 && whfast->nodes == NULL)){
         reb_simulation_error(r, "WHFast HJ requires a fixed tree. Provide one with integrate(..., given_tree=True, tree=...).");
         return;
     }
@@ -548,24 +535,29 @@ void reb_integrator_whfast_hj_step(struct reb_simulation* const r, void* state)
         return;
     }
     for (size_t i=0; i<whfast->tree_N; i++){
-        if (r->particles[i].m != whfast->nodes[i].barycenter_particle.m){
+        if (r->particles[i].m != whfast->masses[i]){
             reb_simulation_error(r, "WHFast HJ requires fixed particle masses after the hierarchy is set.");
             return;
         }
     }
-    reb_integrator_whfast_hj_from_inertial(r, whfast);
+    reb_integrator_whfast_hj_from_inertial(r, whfast, 0);
 
     reb_integrator_whfast_hj_kepler_step(r, whfast, dt/2.);
-    reb_integrator_whfast_hj_com_step(whfast, dt/2.);
+    reb_integrator_whfast_hj_com_step(r, whfast, dt/2.);
     reb_integrator_whfast_hj_to_inertial(r, whfast);
 
     r->gravity_ignore_terms = REB_GRAVITY_IGNORE_TERMS_NONE;
+    const int refresh_coordinates = r->additional_forces || r->gravity == REB_GRAVITY_CUSTOM;
     reb_simulation_update_acceleration(r);
-    reb_integrator_whfast_hj_from_inertial(r, whfast);
+    // Preserve the old behavior even for callbacks that also modify x/v.
+    if (refresh_coordinates){
+        reb_integrator_whfast_hj_from_inertial(r, whfast, 0);
+    }
+    reb_integrator_whfast_hj_from_inertial(r, whfast, 1);
     reb_integrator_whfast_hj_interaction_step(r, whfast, dt);
 
     reb_integrator_whfast_hj_kepler_step(r, whfast, dt/2.);
-    reb_integrator_whfast_hj_com_step(whfast, dt/2.);
+    reb_integrator_whfast_hj_com_step(r, whfast, dt/2.);
     reb_integrator_whfast_hj_to_inertial(r, whfast);
 
     r->t += dt;

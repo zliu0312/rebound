@@ -8,20 +8,22 @@ REB_API int reb_integrator_whfast_hj_set_binary_plus_particles_tree(struct reb_s
 REB_API void reb_integrator_whfast_hj_clear_tree(struct reb_simulation* const r);
 
 struct reb_integrator_whfast_hj_node {
-    struct reb_particle barycenter_particle;
-    struct reb_particle jacobi_particle;
-
     size_t primary;
     size_t secondary;
-
+    size_t barycenter;  // Particle index, or tree_N + shared barycenter index.
     double primary_offset;
     double secondary_offset;
 };
 
 struct reb_integrator_whfast_hj_state {
-    // Fixed hierarchy, stored in postorder: leaves first, then binary orbits.
+    // One entry per binary orbit, in postorder. Child indices below tree_N
+    // refer to particles; larger indices refer to nodes[index - tree_N].
     struct reb_integrator_whfast_hj_node* nodes;
+    struct reb_particle* p_jh;         // Relative coordinates; m is the orbit's total mass.
+    struct reb_particle* barycenters; // Only binaries with two nonzero-mass children.
+    double* masses;                  // Original particle masses for validation.
     size_t tree_N;
+    size_t N_barycenters;
 
     // Set after a user-supplied tree has been compiled into nodes.
     int given_tree;
