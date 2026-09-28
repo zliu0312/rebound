@@ -68,34 +68,15 @@ class TestIntegratorWHFastHJGivenTree(unittest.TestCase):
         sim.integrate(0.0, given_tree=True, tree=" \t[ [01, 002] ,\n03 ] ")
         self.assertEqual(self.hj_tree_string(sim), "[[1,2],3]")
 
-    def test_invalid_tree_syntax_preserves_previous_tree(self):
-        sim = self.make_sim()
-        sim.integrate(0.0, given_tree=True, tree="[[1,2],3]")
-        invalid_trees = (
-            ("", "expected '[' or particle index"),
-            ("[]", "empty tree for a non-empty simulation"),
-            ("[[],3]", "empty subtree"),
-            ("[[1,2],[]]", "empty subtree"),
-            ("[[1 2],3]", "expected ','"),
-            ("[[1,2],3", "expected ']'"),
-            ("[1,2,3]", "expected ']'"),
-            ("[[1,2],3] trailing", "trailing characters"),
-            ("[1,2]", "every particle exactly once"),
-            ("[[0,2],3]", "particle index out of range"),
-            ("[[1,4],3]", "particle index out of range"),
-            ("[[1,2],2]", "duplicate particle index"),
-            ("[[1,-2],3]", "expected '[' or particle index"),
-            ("[[1,2]," + "9"*100 + "]", "particle index is too large"),
-        )
-        for tree, message in invalid_trees:
-            with self.subTest(tree=tree):
-                with self.assertRaises(RuntimeError) as error:
-                    sim.integrate(0.1, given_tree=True, tree=tree)
-                self.assertIn(message, str(error.exception))
-                self.assertEqual(sim.t, 0.0)
-                self.assertEqual(self.hj_tree_string(sim), "[[1,2],3]")
-        sim.integrate(0.1)
-        self.assertAlmostEqual(sim.t, 0.1)
+    def test_empty_tree_roundtrips(self):
+        sim = rebound.Simulation()
+        sim.integrator = "whfast_hj"
+        setter = rebound.clibrebound.reb_integrator_whfast_hj_set_tree
+        setter.argtypes = [ctypes.POINTER(rebound.Simulation), ctypes.c_char_p]
+        setter.restype = ctypes.c_int
+        self.assertEqual(setter(ctypes.byref(sim), b"[]"), 0)
+        self.assertEqual(sim.integrator.given_tree, 1)
+        self.assertEqual(self.hj_tree_string(sim), "[]")
 
     def test_given_tree_accepts_binary_plus_particles_mode(self):
         sim_explicit = self.make_sim()
@@ -113,23 +94,12 @@ class TestIntegratorWHFastHJGivenTree(unittest.TestCase):
                     delta=1e-14,
                 )
 
-    def test_given_tree_rejects_duplicate_particle(self):
-        sim = self.make_sim()
-        with self.assertRaises(RuntimeError):
-            sim.integrate(0.01, exact_finish_time=0, given_tree=True, tree="[1,1]")
-
     def test_fixed_tree_rejects_mass_changes(self):
         sim = self.make_sim()
         sim.integrate(0.01, exact_finish_time=0, given_tree=True, tree="[[1,2],3]")
         sim.particles[1].m = 0.2
         with self.assertRaises(RuntimeError):
             sim.integrate(0.02, exact_finish_time=0)
-
-    def test_fixed_tree_rejects_zero_mass_binary(self):
-        sim = self.make_sim()
-        sim.add(m=0.0, a=3.0)
-        with self.assertRaises(RuntimeError):
-            sim.integrate(0.01, exact_finish_time=0, given_tree=True, tree="[[1,2],[3,4]]")
 
     def test_copied_simulation_requires_tree_again(self):
         sim = self.make_sim()
@@ -138,17 +108,33 @@ class TestIntegratorWHFastHJGivenTree(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             copied.integrate(0.02, exact_finish_time=0)
 
-    def test_invalid_replacement_preserves_fixed_tree(self):
+    def test_valid_replacement_refreshes_fixed_tree(self):
         sim = self.make_sim()
-        tree = "[[1,2],3]"
-        sim.integrate(0.05, given_tree=True, tree=tree)
-        before = [(p.x, p.y, p.z, p.vx, p.vy, p.vz) for p in sim.particles]
-        with self.assertRaises(RuntimeError):
-            sim.integrate(0.1, given_tree=True, tree="[[1,2],2]")
+        sim.integrate(0.05, given_tree=True, tree="[[1,2],3]")
+        sim.particles[1].m = 0.2
+        sim.add(m=0.0, x=4.0, vy=0.5)
+
+        # Compare replacement against a fresh setup with the new count and masses.
+        reference = rebound.Simulation()
+        reference.integrator = "whfast_hj"
+        reference.G = sim.G
+        reference.dt = sim.dt
+        reference.t = sim.t
+        for particle in sim.particles:
+            reference.add(particle)
+
+        coordinates = ("x", "y", "z", "vx", "vy", "vz")
+        before = [tuple(getattr(p, attr) for attr in coordinates) for p in sim.particles]
+        tree = "[3,[[2,1],4]]"
+        sim.integrate(sim.t, given_tree=True, tree=tree)
         self.assertEqual(self.hj_tree_string(sim), tree)
-        self.assertEqual(before, [(p.x, p.y, p.z, p.vx, p.vy, p.vz) for p in sim.particles])
+        self.assertEqual(before, [tuple(getattr(p, attr) for attr in coordinates) for p in sim.particles])
         sim.integrate(0.1)
+        reference.integrate(0.1, given_tree=True, tree=tree)
         self.assertAlmostEqual(sim.t, 0.1)
+        for actual, expected in zip(sim.particles, reference.particles):
+            for attr in coordinates:
+                self.assertAlmostEqual(getattr(actual, attr), getattr(expected, attr), delta=2e-12)
 
     def test_fixed_tree_rejects_particle_count_changes(self):
         sim = self.make_sim()

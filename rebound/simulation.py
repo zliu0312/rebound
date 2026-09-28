@@ -1320,6 +1320,7 @@ class Simulation(Structure):
             Only used by the ``whfast_hj`` integrator. If true, compile and cache the supplied fixed HJ tree.
         tree: str or nested tuple/list, optional
             The fixed HJ tree to use when ``given_tree=True``. Leaves are 1-based particle indices, for example ``"[[1,2],3]"`` or ``[[1, 2], 3]``. The special string ``"binary_plus_particles"`` builds ``[[[1,2],3],...]`` directly in C. WHFast HJ requires a tree before its first timestep and reuses it on later calls.
+            C tree setup assumes valid input: each particle must occur exactly once and every binary must have positive total mass. Tree strings must have valid binary-pair syntax; these requirements are not checked in C.
         
         Exceptions
         ----------
