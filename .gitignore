@@ -56,3 +56,7 @@ tags
 .nfs*
 *.asm_o
 utsc_nfs/
+
+# Local AI instructions and working memory; never stage or commit these files.
+/AGENTS.md
+/REBOUND_WORKING_MEMORY.md

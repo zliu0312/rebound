@@ -45,7 +45,6 @@ void* reb_integrator_whfast_hj_create(void)
 static void reb_integrator_whfast_hj_clear_state(struct reb_integrator_whfast_hj_state* const whfast)
 {
     free(whfast->nodes);
-    free(whfast->p_jh);
     free(whfast->barycenters);
     free(whfast->masses);
     *whfast = (struct reb_integrator_whfast_hj_state){0};
@@ -79,7 +78,7 @@ static struct reb_particle* reb_integrator_whfast_hj_barycenter(
 static double reb_integrator_whfast_hj_subtree_mass(
     const struct reb_integrator_whfast_hj_state* const whfast, const size_t index
 ){
-    return index < whfast->tree_N ? whfast->masses[index] : whfast->p_jh[index - whfast->tree_N].m;
+    return index < whfast->tree_N ? whfast->masses[index] : whfast->nodes[index - whfast->tree_N].q.m;
 }
 
 static int reb_integrator_whfast_hj_initialize_internal(
@@ -99,7 +98,7 @@ static int reb_integrator_whfast_hj_initialize_internal(
     node->secondary = secondary;
     node->primary_offset = secondary_mass/total_mass;
     node->secondary_offset = primary_mass/total_mass;
-    whfast->p_jh[index - whfast->tree_N].m = total_mass;
+    node->q.m = total_mass;
     if (primary_mass == 0.){
         node->barycenter = reb_integrator_whfast_hj_barycenter_index(whfast, secondary);
     }else if (secondary_mass == 0.){
@@ -111,7 +110,6 @@ static int reb_integrator_whfast_hj_initialize_internal(
 }
 
 struct reb_integrator_whfast_hj_tree_parser {
-    struct reb_simulation* r;
     struct reb_integrator_whfast_hj_state* whfast;
     const char* cursor;
     unsigned char* used;
@@ -127,13 +125,14 @@ static void reb_integrator_whfast_hj_tree_parser_skip_space(struct reb_integrato
     }
 }
 
-static void reb_integrator_whfast_hj_tree_parser_error(
+static size_t reb_integrator_whfast_hj_tree_parser_error(
     struct reb_integrator_whfast_hj_tree_parser* const parser,
     const char* const error
 ){
     if (parser->error == NULL){
         parser->error = error;
     }
+    return SIZE_MAX;
 }
 
 // The input grammar is recursive, but the result is a flat postordered array.
@@ -150,46 +149,26 @@ static size_t reb_integrator_whfast_hj_parse_tree_node(struct reb_integrator_whf
             return SIZE_MAX;
         }
 
-        const size_t primary = reb_integrator_whfast_hj_parse_tree_node(parser);
-        if (parser->error != NULL){
-            return SIZE_MAX;
-        }
-        if (primary == SIZE_MAX){
-            reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: empty subtree.");
-            return SIZE_MAX;
-        }
-
-        reb_integrator_whfast_hj_tree_parser_skip_space(parser);
-        if (*parser->cursor != ','){
-            reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: expected ','.");
-            return SIZE_MAX;
-        }
-        parser->cursor++;
-
-        const size_t secondary = reb_integrator_whfast_hj_parse_tree_node(parser);
-        if (parser->error != NULL){
-            return SIZE_MAX;
-        }
-        if (secondary == SIZE_MAX){
-            reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: empty subtree.");
-            return SIZE_MAX;
+        size_t children[2];
+        for (int i=0; i<2; i++){
+            children[i] = reb_integrator_whfast_hj_parse_tree_node(parser);
+            if (children[i] == SIZE_MAX){
+                // Preserve a child's parse error, or report an empty subtree.
+                return reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: empty subtree.");
+            }
+            reb_integrator_whfast_hj_tree_parser_skip_space(parser);
+            if (*parser->cursor != (i == 0 ? ',' : ']')){
+                return reb_integrator_whfast_hj_tree_parser_error(parser,
+                        i == 0 ? "Invalid WHFast HJ tree: expected ','." : "Invalid WHFast HJ tree: expected ']'.");
+            }
+            parser->cursor++;
         }
 
-        reb_integrator_whfast_hj_tree_parser_skip_space(parser);
-        if (*parser->cursor != ']'){
-            reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: expected ']'.");
-            return SIZE_MAX;
-        }
-        parser->cursor++;
-
-        if (parser->next_internal >= reb_integrator_whfast_hj_node_count(parser->whfast->tree_N)){
-            reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: too many binary nodes.");
-            return SIZE_MAX;
-        }
+        // Unique in-range leaves allow at most tree_N - 1 internal binary nodes.
         const size_t index = parser->next_internal++;
-        if (reb_integrator_whfast_hj_initialize_internal(parser->whfast, index, primary, secondary)){
-            reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: each binary orbit must have positive total mass.");
-            return SIZE_MAX;
+        // here
+        if (reb_integrator_whfast_hj_initialize_internal(parser->whfast, index, children[0], children[1])){
+            return reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: each binary orbit must have positive total mass.");
         }
         return index;
     }
@@ -199,21 +178,18 @@ static size_t reb_integrator_whfast_hj_parse_tree_node(struct reb_integrator_whf
         while (isdigit((unsigned char)*parser->cursor)){
             const unsigned int digit = (unsigned int)(*parser->cursor - '0');
             if (particle_number > (ULLONG_MAX - digit)/10ULL){
-                reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: particle index is too large.");
-                return SIZE_MAX;
+                return reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: particle index is too large.");
             }
             particle_number = 10ULL*particle_number + digit;
             parser->cursor++;
         }
 
-        if (particle_number == 0ULL || particle_number > (unsigned long long)parser->r->N){
-            reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: particle index out of range.");
-            return SIZE_MAX;
+        if (particle_number == 0ULL || particle_number > (unsigned long long)parser->whfast->tree_N){
+            return reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: particle index out of range.");
         }
         const size_t particle_index = (size_t)(particle_number - 1ULL);
         if (parser->used[particle_index]){
-            reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: duplicate particle index.");
-            return SIZE_MAX;
+            return reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: duplicate particle index.");
         }
 
         parser->used[particle_index] = 1;
@@ -221,15 +197,21 @@ static size_t reb_integrator_whfast_hj_parse_tree_node(struct reb_integrator_whf
         return particle_index;
     }
 
-    reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: expected '[' or particle index.");
-    return SIZE_MAX;
+    return reb_integrator_whfast_hj_tree_parser_error(parser, "Invalid WHFast HJ tree: expected '[' or particle index.");
 }
 
 static int reb_integrator_whfast_hj_allocate_fixed_tree(
     struct reb_simulation* const r,
     struct reb_integrator_whfast_hj_state* const whfast
 ){
-    if (r->N > 0 && r->N > SIZE_MAX/2U + 1U){
+    if (r == NULL){
+        return 1;
+    }
+    if (r->integrator.name == NULL || strcmp(r->integrator.name, "whfast_hj") != 0 || r->integrator.state == NULL){
+        reb_simulation_error(r, "WHFast HJ tree can only be set when the selected integrator is whfast_hj.");
+        return 1;
+    }
+    if (r->N > SIZE_MAX/2U + 1U){
         reb_simulation_error(r, "WHFast HJ tree does not support this many particles.");
         return 1;
     }
@@ -237,14 +219,13 @@ static int reb_integrator_whfast_hj_allocate_fixed_tree(
     const size_t orbit_count = r->N > 0 ? r->N - 1 : 0;
     whfast->masses = r->N ? calloc(r->N, sizeof(*whfast->masses)) : NULL;
     whfast->nodes = orbit_count ? calloc(orbit_count, sizeof(*whfast->nodes)) : NULL;
-    whfast->p_jh = orbit_count ? calloc(orbit_count, sizeof(*whfast->p_jh)) : NULL;
     // At most K-1 new barycenters are needed for K nonzero-mass particles.
     size_t massive_count = 0;
     for (size_t i=0; i<r->N; i++){
         massive_count += r->particles[i].m != 0.;
     }
     whfast->barycenters = massive_count > 1 ? calloc(massive_count - 1, sizeof(*whfast->barycenters)) : NULL;
-    if ((r->N && !whfast->masses) || (orbit_count && (!whfast->nodes || !whfast->p_jh)) ||
+    if ((r->N && !whfast->masses) || (orbit_count && !whfast->nodes) ||
             (massive_count > 1 && !whfast->barycenters)){
         reb_integrator_whfast_hj_clear_state(whfast);
         reb_simulation_error(r, "WHFast HJ was not able to allocate memory for the fixed hierarchy.");
@@ -258,11 +239,7 @@ static int reb_integrator_whfast_hj_allocate_fixed_tree(
 
 REB_API int reb_integrator_whfast_hj_set_tree(struct reb_simulation* const r, const char* const tree)
 {
-    if (r == NULL || tree == NULL){
-        return 1;
-    }
-    if (r->integrator.name == NULL || strcmp(r->integrator.name, "whfast_hj") != 0 || r->integrator.state == NULL){
-        reb_simulation_error(r, "WHFast HJ tree can only be set when the selected integrator is whfast_hj.");
+    if (tree == NULL){
         return 1;
     }
 
@@ -279,7 +256,6 @@ REB_API int reb_integrator_whfast_hj_set_tree(struct reb_simulation* const r, co
     }
 
     struct reb_integrator_whfast_hj_tree_parser parser = {
-        .r = r,
         .whfast = &candidate,
         .cursor = tree,
         .used = used,
@@ -294,8 +270,6 @@ REB_API int reb_integrator_whfast_hj_set_tree(struct reb_simulation* const r, co
             reb_integrator_whfast_hj_tree_parser_error(&parser, "Invalid WHFast HJ tree: empty tree for a non-empty simulation.");
         }else if (parser.leaf_count != r->N){
             reb_integrator_whfast_hj_tree_parser_error(&parser, "Invalid WHFast HJ tree: tree must include every particle exactly once.");
-        }else if (parser.next_internal != reb_integrator_whfast_hj_node_count(r->N)){
-            reb_integrator_whfast_hj_tree_parser_error(&parser, "Invalid WHFast HJ tree: expected a full binary hierarchy.");
         }
     }
     free(used);
@@ -315,30 +289,20 @@ REB_API int reb_integrator_whfast_hj_set_tree(struct reb_simulation* const r, co
 
 REB_API int reb_integrator_whfast_hj_set_binary_plus_particles_tree(struct reb_simulation* const r)
 {
-    if (r == NULL){
-        return 1;
-    }
-    if (r->integrator.name == NULL || strcmp(r->integrator.name, "whfast_hj") != 0 || r->integrator.state == NULL){
-        reb_simulation_error(r, "WHFast HJ tree can only be set when the selected integrator is whfast_hj.");
-        return 1;
-    }
-
     struct reb_integrator_whfast_hj_state candidate = {0};
     if (reb_integrator_whfast_hj_allocate_fixed_tree(r, &candidate)){
         return 1;
     }
 
-    if (r->N > 0){
-        size_t root = 0;
-        for (size_t i=1; i<r->N; i++){
-            const size_t index = r->N + i - 1;
-            if (reb_integrator_whfast_hj_initialize_internal(&candidate, index, root, i)){
-                reb_integrator_whfast_hj_clear_state(&candidate);
-                reb_simulation_error(r, "WHFast HJ requires each binary orbit to have positive total mass.");
-                return 1;
-            }
-            root = index;
+    size_t root = 0;
+    for (size_t i=1; i<r->N; i++){
+        const size_t index = r->N + i - 1;
+        if (reb_integrator_whfast_hj_initialize_internal(&candidate, index, root, i)){
+            reb_integrator_whfast_hj_clear_state(&candidate);
+            reb_simulation_error(r, "WHFast HJ requires each binary orbit to have positive total mass.");
+            return 1;
         }
+        root = index;
     }
 
     candidate.given_tree = 1;
@@ -346,14 +310,6 @@ REB_API int reb_integrator_whfast_hj_set_binary_plus_particles_tree(struct reb_s
     reb_integrator_whfast_hj_clear_state(whfast);
     *whfast = candidate;
     return 0;
-}
-
-REB_API void reb_integrator_whfast_hj_clear_tree(struct reb_simulation* const r)
-{
-    if (r == NULL || r->integrator.name == NULL || strcmp(r->integrator.name, "whfast_hj") != 0 || r->integrator.state == NULL){
-        return;
-    }
-    reb_integrator_whfast_hj_clear_state(r->integrator.state);
 }
 
 static void reb_integrator_whfast_hj_tree_append(
@@ -430,10 +386,10 @@ static void reb_integrator_whfast_hj_from_inertial(
     const int accelerations
 ){
     for (size_t i=0; i+1<whfast->tree_N; i++){
-        const struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[i];
+        struct reb_integrator_whfast_hj_node* const node = &whfast->nodes[i];
         const struct reb_particle* const primary = reb_integrator_whfast_hj_barycenter(r, whfast, node->primary);
         const struct reb_particle* const secondary = reb_integrator_whfast_hj_barycenter(r, whfast, node->secondary);
-        struct reb_particle* const q = &whfast->p_jh[i];
+        struct reb_particle* const q = &node->q;
         struct reb_particle* const com = reb_integrator_whfast_hj_barycenter(r, whfast, whfast->tree_N + i);
         const int shared = com == primary || com == secondary;
 #define HJ_FORWARD(field) \
@@ -458,7 +414,7 @@ static void reb_integrator_whfast_hj_to_inertial(
         struct reb_particle* const primary = reb_integrator_whfast_hj_barycenter(r, whfast, node->primary);
         struct reb_particle* const secondary = reb_integrator_whfast_hj_barycenter(r, whfast, node->secondary);
         const struct reb_particle* const com = reb_integrator_whfast_hj_barycenter(r, whfast, whfast->tree_N + i);
-        const struct reb_particle* const q = &whfast->p_jh[i];
+        const struct reb_particle* const q = &node->q;
         // Shared hosts have already been reconstructed by their ancestors.
         // Only place the massless child; do not rewrite the host for each tracer.
 #define HJ_PRIMARY(field) primary->field = com->field - node->primary_offset*q->field
@@ -482,7 +438,7 @@ static void reb_integrator_whfast_hj_interaction_step(
     const double dt
 ){
     for (size_t i=0; i+1<whfast->tree_N; i++){
-        struct reb_particle* const p = &whfast->p_jh[i];
+        struct reb_particle* const p = &whfast->nodes[i].q;
         p->vx += dt*p->ax;
         p->vy += dt*p->ay;
         p->vz += dt*p->az;
@@ -502,7 +458,8 @@ static void reb_integrator_whfast_hj_kepler_step(
     const double dt
 ){
     for (size_t i=0; i+1<whfast->tree_N; i++){
-        reb_integrator_whfast_kepler_solver(&whfast->p_jh[i], whfast->p_jh[i].m*r->G, dt, r);
+        struct reb_particle* const q = &whfast->nodes[i].q;
+        reb_integrator_whfast_kepler_solver(q, q->m*r->G, dt, r);
     }
 }
 
